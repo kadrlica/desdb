@@ -15,6 +15,14 @@ except ImportError as e:
     raise e
 
 try:
+    import psycopg2
+    from psycopg2.extensions import connection as pgConnection
+except ImportError as e:
+    # make sure we send a message
+    sys.stderr.write("Could not import psycopg2: %s" % str(e))
+    raise e
+
+try:
     import json
     have_json=True
 except:
@@ -28,8 +36,10 @@ except:
 _url_template = "%s:%s/%s"
 
 _defhost = 'leovip148.ncsa.uiuc.edu'
-_defport = 1521
 _defdb = 'dessci'
+_deftype = 'oracle'
+_defport = {'oracle':1521,'postgres':5432}
+_defsec = 'db-dessci'
 
 _release_map={'dc6b':'dr012', 'dr012':'dr012'}
 
@@ -64,7 +74,7 @@ def dataset2release(dataset):
 def connect(**keys):
     return Connection(**keys)
 
-class Connection(cx_Oracle.Connection):
+class BaseConnection(object):
     """
     A simple wrapper to the cx_oracle connection object.
 
@@ -103,13 +113,8 @@ class Connection(cx_Oracle.Connection):
         """
         p=PasswordGetter(**keys)
         self._pwd_getter=p
-
-        self._process_pars(**keys)
-
-        url = _url_template % (p.host, self._port, self._dbname)
-
-        cx_Oracle.Connection.__init__(self,p.user,p.password,url)
-
+        self._port = keys.get('port',p.port)
+        self._dbname = keys.get('port',p.dbname)
 
     def quick(self, query, lists=False, strings=False, array=False,
               show=False, **keys):
@@ -296,6 +301,45 @@ class Connection(cx_Oracle.Connection):
 
         return '\n'.join(rep)
 
+class OracleConnection(BaseConnection,cx_Oracle.Connection):
+    """ Oracle Connection object """
+
+    _url_template = "%s:%s/%s"
+
+    def __init__(self, **kwargs):
+        super(OracleConnection,self).__init__(**kwargs)
+        p = self._pwd_getter
+        url = self._url_template%(p.host, self._port, self._dbname)
+        cx_Oracle.Connection.__init__(self,p.user,p.password,url)
+
+class PostgresConnection(BaseConnection,pgConnection):
+    """ Postgres Connection object """
+
+    _url_template = 'host=%s dbname=%s user=%s password=%s port=%s'
+
+    def __init__(self, **kwargs):
+        super(PostgresConnection,self).__init__(**kwargs)
+        p = self._pwd_getter
+        url = self._url_template%(p.host,p.dbname,p.user,p.password,p.port)
+        pgConnection.__init__ (self, url)
+
+class Connection(BaseConnection):
+    """ Factory for creating connection object """
+
+    def __new__(self, **kwargs):
+        # Can't simultaneously subclass Oracle and Postgres
+        # connection objects due to 'instance lay-out conflict'
+        # (i.e., incompatible C implementations)
+        # To avoid this, subclass __new__ to essentially make
+        # Connection a factory.
+        p = PasswordGetter(**kwargs)
+        if p.dbtype=='oracle':
+            return OracleConnection(**kwargs)
+        elif p.dbtype=='postgres':
+            return PostgresConnection(**kwargs)
+        else:
+            msg = "Unrecognized db type: %s"%self._auth.dbtype
+            raise TypeError
 
 def cursor2dictlist(curs, lower=True):
     if curs is None:
@@ -625,25 +669,26 @@ class PasswordGetter:
     """
     Try to get username/password from different sources.
 
-    First there are the keywords user=, password= which take precedence.
+    First there are the keywords 'user', 'password' which take precedence.
 
-    The types to try are listed in the types= keyword as a list.
-    Defaults to only trying netrc
+    The types to try are listed in the 'types' keyword as a list.
+    Allowed types are:
+       'services', 'netrc', or 'desdb_pass' (deprecated)
 
-    Allowed types are
-        'netrc' or 'desdb_pass' (deprecated)
-
-    netrc is much more general, as it can be used for any url.
+    'sevices' and 'netrc' are more general, and can be used for any url.
     """
-    def __init__(self, user=None, password=None, host=_defhost,
-                 types=['netrc','desdb_pass'], **keys):
-
-        self._host=host
-        if self._host is None:
-            self._host=_defhost
+    def __init__(self, user=None, password=None, 
+                 types=['services','netrc','desdb_pass'], **kwargs):
+        # Should use default dictionary
+        self._host    = kwargs.get('host',_defhost)
+        self._dbname  = kwargs.get('name',_defdb)
+        self._dbtype  = kwargs.get('dbtype',_deftype)
+        self._port    = kwargs.get('port',_defport[self.dbtype])
+        self._section = kwargs.get('section',_defsec)
 
         self._types=types
         self._type=None
+
         self._password=None
         self._user=None
 
@@ -667,13 +712,20 @@ class PasswordGetter:
     def password(self):
         return self._password
     @property
-    def type(self):
-        return self._type
-    @property
     def host(self):
         return self._host
-
-
+    @property
+    def dbname(self):
+        return self._dbname
+    @property
+    def dbtype(self):
+        return self._dbtype
+    @property
+    def port(self):
+        return self._port
+    @property
+    def type(self):
+        return self._type
 
     def _set_username_password(self, type):
         gotit=False
@@ -681,8 +733,10 @@ class PasswordGetter:
             gotit=self._try_netrc()
         elif type=='desdb_pass':
             gotit=self._try_desdb_pass()
+        elif type=='services':
+            gotit=self._try_services()
         else:
-            raise ValueError("expected type 'netrc' or 'desdb_pass'")
+            raise ValueError("expected type 'netrc','services', or 'desdb_pass'")
 
         return gotit
 
@@ -745,6 +799,34 @@ class PasswordGetter:
             self._user=data[0].strip()
             self._password=data[1].strip()
 
+        return True
+
+    def _try_services(self):
+        """
+        DES services file:
+        https://deswiki.cosmology.illinois.edu/confluence/x/aoAM
+        """
+        import ConfigParser
+
+        fname=os.path.join( os.environ['HOME'], '.desservices.ini')
+        if not os.path.exists(fname):
+            return False
+
+        self._check_perms(fname)
+
+        c = ConfigParser.RawConfigParser()
+        c.read(fname)
+
+        d={}
+        [d.__setitem__(k,v.lower()) for (k,v) in c.items(self._section)]
+
+        self._user = d.get('user')
+        self._password = d.get('passwd')
+        self._host = d.get('server')
+        self._dbtype = d.get('type')
+        self._dbname = d.get('name')
+        if self._dbtype=='oracle'  : self._port = d.get('port',_defport['oracle'])
+        if self._dbtype=='postgres': self._port = d.get('port',_defport['postgres'])
         return True
 
 def cursor2array(curs,
