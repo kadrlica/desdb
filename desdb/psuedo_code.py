@@ -2,8 +2,8 @@
 import cx_Oracle, psycopg2
 from psycopg2.extensions import connection as pgConnection
 
-# This is essentially PasswordGetter but modified to take services
-# file if available.
+# Authenticator is like PasswordGetter but modified to take services
+# file and store info about dbtype.
 from auth import Authenticator
 
 class BaseConnection(object):
@@ -14,7 +14,11 @@ class BaseConnection(object):
         self._dbname = keys.get('port',p.dbname)
 
 class OracleConnection(BaseConnection,cx_Oracle.Connection):
-    """ Oracle Connection object """
+    """ 
+    Oracle Connection object.
+    
+    Could come from despydb.oracon for dialect neutral wrapping.
+    """
 
     _url_template = "%s:%s/%s"
 
@@ -25,7 +29,11 @@ class OracleConnection(BaseConnection,cx_Oracle.Connection):
         cx_Oracle.Connection.__init__(self,p.user,p.password,url)
 
 class PostgresConnection(BaseConnection,pgConnection):
-    """ Postgres Connection object """
+    """ 
+    Postgres Connection object 
+
+    Could come from despydb.pgcon for dialect neutral wrapping.
+    """
 
     _url_template = 'host=%s dbname=%s user=%s password=%s port=%s'
 
